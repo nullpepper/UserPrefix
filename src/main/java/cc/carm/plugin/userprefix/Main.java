@@ -57,7 +57,7 @@ public class Main extends EasyPlugin {
         log("   成功加载了 " + loaded + " 个前缀配置。");
 
         log("加载用户管理器...");
-        this.userManager = new UserManager();
+        this.userManager = new UserManager(prefixManager, PluginConfig.FUNCTIONS.AUTO_USE::getNotNull);
 
         log("注册指令...");
         registerCommand("UserPrefix", new UserCommand());

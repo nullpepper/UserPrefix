@@ -24,6 +24,7 @@ public class ReloadCommand extends SubCommand<AdminCommand> {
         try {
             UserPrefixAPI.getConfigManager().reload(); // 重载配置文件
             int num = UserPrefixAPI.getPrefixManager().loadPrefixes(); //加载重载后了的前缀配置
+            UserPrefixAPI.getUserManager().clearOfflineCache(); // 清空离线前缀缓存，防止悬挂旧前缀配置对象
             for (Player onlinePlayer : Bukkit.getOnlinePlayers()) {
                 UserPrefixAPI.getUserManager().checkPrefix(onlinePlayer, false);
                 /*

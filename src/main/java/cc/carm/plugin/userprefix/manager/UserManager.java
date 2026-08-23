@@ -19,7 +19,8 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.*;
-import java.util.stream.Collectors;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BooleanSupplier;
 
 public class UserManager {
 
@@ -29,6 +30,32 @@ public class UserManager {
     protected final HashMap<UUID, UserNameTag> nameTags = new HashMap<>();
 
     protected final HashSet<UUID> checkingPlayers = new HashSet<>();
+
+    protected final @NotNull PrefixResolver resolver;
+
+    /** 离线玩家前缀缓存（UUID -> 解析结果），TTL见 {@link #OFFLINE_CACHE_TTL} */
+    protected final Map<UUID, CachedPrefix> offlinePrefixCache = new ConcurrentHashMap<>();
+
+    /** 正在进行异步加载的离线玩家，用于并发去重 */
+    protected final Set<UUID> offlineLoading = ConcurrentHashMap.newKeySet();
+
+    /** 离线缓存的有效时长，防止离线期间权限/数据被外部修改后长期显示旧值 */
+    protected static final long OFFLINE_CACHE_TTL = 5 * 60 * 1000L;
+
+    public UserManager(@NotNull PrefixManager prefixManager, @NotNull BooleanSupplier autoUse) {
+        this.resolver = new PrefixResolver(prefixManager, autoUse);
+    }
+
+    protected static class CachedPrefix {
+
+        protected final @NotNull PrefixConfig prefix;
+        protected final long loadedAt;
+
+        public CachedPrefix(@NotNull PrefixConfig prefix, long loadedAt) {
+            this.prefix = prefix;
+            this.loadedAt = loadedAt;
+        }
+    }
 
     @Nullable
     public UserNameTag getNameTag(Player player) {
@@ -155,6 +182,76 @@ public class UserManager {
     }
 
     /**
+     * 获取离线玩家的前缀解析缓存（仅在TTL有效期内返回）。
+     *
+     * @param uuid 玩家UUID
+     * @return 解析结果，未缓存或已过期时为 null
+     */
+    @Nullable
+    public PrefixConfig getOfflinePrefix(@NotNull UUID uuid) {
+        CachedPrefix cached = offlinePrefixCache.get(uuid);
+        if (cached == null) return null;
+        if (System.currentTimeMillis() - cached.loadedAt > OFFLINE_CACHE_TTL) {
+            offlinePrefixCache.remove(uuid);
+            return null;
+        }
+        return cached.prefix;
+    }
+
+    /**
+     * 确保离线玩家的前缀数据已加载：
+     * <ol>
+     *     <li>LuckPerms内存中已有该用户 → 同步解析并写入缓存；</li>
+     *     <li>否则 → 异步加载（同一玩家并发只会触发一次），成功或失败后写入缓存。</li>
+     * </ol>
+     * 该方法不阻塞主线程，加载完成后后续的 {@link #getOfflinePrefix(UUID)} 即可命中缓存。
+     *
+     * @param uuid 玩家UUID
+     */
+    public void ensureOfflineLoaded(@NotNull UUID uuid) {
+        if (getOfflinePrefix(uuid) != null) return; // 缓存仍有效，无需重新加载
+
+        User user = ServiceManager.getUser(uuid); // LuckPerms内存缓存，同步获取
+        if (user != null) {
+            cacheOfflinePrefix(uuid, resolver.resolve(UserData.of(user)));
+            return;
+        }
+
+        if (!offlineLoading.add(uuid)) return; // 已有同玩家的加载任务在途，去重
+
+        ServiceManager.loadUser(uuid).whenComplete((loaded, ex) -> {
+            offlineLoading.remove(uuid);
+            if (ex != null) {
+                // 加载失败：缓存默认前缀，避免占位符永久停留在 Loading...
+                Main.debugging("加载离线玩家(" + uuid + ")的LuckPerms数据失败，将使用默认前缀。 " + ex);
+                cacheOfflinePrefix(uuid, UserPrefixAPI.getDefaultPrefix());
+            } else {
+                cacheOfflinePrefix(uuid, resolver.resolve(UserData.of(loaded)));
+            }
+        });
+    }
+
+    protected void cacheOfflinePrefix(@NotNull UUID uuid, @NotNull PrefixConfig prefix) {
+        offlinePrefixCache.put(uuid, new CachedPrefix(prefix, System.currentTimeMillis()));
+    }
+
+    /**
+     * 使指定离线玩家的前缀缓存失效（如玩家上线、权限重算时调用）。
+     *
+     * @param uuid 玩家UUID
+     */
+    public void invalidateOfflineCache(@NotNull UUID uuid) {
+        offlinePrefixCache.remove(uuid);
+    }
+
+    /**
+     * 清空全部离线玩家前缀缓存（如配置重载时调用）。
+     */
+    public void clearOfflineCache() {
+        offlinePrefixCache.clear();
+    }
+
+    /**
      * 得到玩家的前缀。
      * 该方法会自动判断玩家当前的前缀是否可用，并返回最终可用的前缀。
      *
@@ -163,13 +260,18 @@ public class UserManager {
      */
     @NotNull
     public PrefixConfig getPrefix(Player player) {
-        String identifier = getPrefixData(player);
-        if (identifier == null || !isPrefixUsable(player, identifier)) {
-            return getHighestPrefix(player);
-        } else {
-            PrefixConfig prefix = UserPrefixAPI.getPrefixManager().getPrefix(identifier);
-            return prefix == null ? UserPrefixAPI.getDefaultPrefix() : prefix;
-        }
+        return resolver.resolve(UserData.of(player));
+    }
+
+    /**
+     * 得到离线玩家的前缀（经LuckPerms用户数据解析，与在线玩家语义一致）。
+     *
+     * @param user LuckPerms用户数据
+     * @return 前缀配置
+     */
+    @NotNull
+    public PrefixConfig getPrefix(User user) {
+        return resolver.resolve(UserData.of(user));
     }
 
     /**
@@ -193,10 +295,18 @@ public class UserManager {
      */
     @NotNull
     public List<PrefixConfig> getUsablePrefixes(Player player) {
-        return UserPrefixAPI.getPrefixManager().getPrefixes().values().stream()
-                .filter(prefix -> prefix.checkPermission(player)) //过滤出玩家可用的前缀
-                .sorted(Comparator.comparingInt(PrefixConfig::getWeight)) // 以前缀排序
-                .collect(Collectors.toList()); // 返回集合
+        return resolver.getUsablePrefixes(UserData.of(player));
+    }
+
+    /**
+     * 得到离线玩家所有可用的前缀（经LuckPerms用户数据判定，与在线玩家语义一致）
+     *
+     * @param user LuckPerms用户数据
+     * @return 可用前缀列表
+     */
+    @NotNull
+    public List<PrefixConfig> getUsablePrefixes(User user) {
+        return resolver.getUsablePrefixes(UserData.of(user));
     }
 
 
@@ -209,13 +319,7 @@ public class UserManager {
      */
     @NotNull
     public PrefixConfig getHighestPrefix(Player player) {
-        if (!PluginConfig.FUNCTIONS.AUTO_USE.getNotNull()) {
-            // 关闭了自动选择，就直接给默认的前缀，让玩家自己去设置吧~
-            return UserPrefixAPI.getDefaultPrefix();
-        }
-        return getUsablePrefixes(player).stream()
-                .max(Comparator.comparingInt(PrefixConfig::getWeight)) // 取权重最大
-                .orElseGet(UserPrefixAPI::getDefaultPrefix); // 啥都没有？ 返回默认前缀。
+        return resolver.getHighestPrefix(UserData.of(player));
     }
 
     /**
@@ -227,9 +331,7 @@ public class UserManager {
      */
     @SuppressWarnings("BooleanMethodIsAlwaysInverted")
     public boolean isPrefixUsable(Player player, String prefixIdentifier) {
-        if (prefixIdentifier == null || prefixIdentifier.equalsIgnoreCase("default")) return true;
-        PrefixConfig prefix = UserPrefixAPI.getPrefixManager().getPrefix(prefixIdentifier);
-        return prefix != null && prefix.checkPermission(player);
+        return resolver.isPrefixUsable(UserData.of(player), prefixIdentifier);
     }
 
 

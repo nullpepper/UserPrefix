@@ -10,6 +10,9 @@ import org.bukkit.entity.Player;
 public class UserPermListener {
 
     public static void process(UserDataRecalculateEvent event) {
+        // 权限/数据重算（含离线场景），使离线前缀缓存失效
+        UserPrefixAPI.getUserManager().invalidateOfflineCache(event.getUser().getUniqueId());
+
         Player player = Bukkit.getPlayer(event.getUser().getUniqueId());
         if (player == null) return;
         UserPrefixAPI.getUserManager().checkPrefix(player, true);

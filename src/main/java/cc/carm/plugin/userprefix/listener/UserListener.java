@@ -10,6 +10,8 @@ public class UserListener implements Listener {
 
     @EventHandler
     public void onJoin(PlayerJoinEvent event) {
+        // 玩家上线，使离线期间缓存的前缀数据失效，确保使用最新数据
+        UserPrefixAPI.getUserManager().invalidateOfflineCache(event.getPlayer().getUniqueId());
         UserPrefixAPI.getUserManager().initPlayer(event.getPlayer());
     }
 

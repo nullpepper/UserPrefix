@@ -7,6 +7,9 @@ import cc.carm.lib.easyplugin.utils.MessageUtils;
 import cc.carm.lib.mineconfiguration.bukkit.value.item.PreparedItem;
 import cc.carm.plugin.userprefix.Main;
 import cc.carm.plugin.userprefix.manager.ServiceManager;
+import me.clip.placeholderapi.PlaceholderAPI;
+import net.luckperms.api.model.user.User;
+import org.bukkit.OfflinePlayer;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.ItemStack;
@@ -130,19 +133,38 @@ public class PrefixConfig {
     @NotNull
     public String getContent(CommandSender viewer) {
         if (content.isEmpty()) return "?";
-        if (period < 0 || content.size() == 1) {
-            return ColorParser.parse(MessageUtils.setPlaceholders(viewer, content.get(0)));
-        }
+        return ColorParser.parse(MessageUtils.setPlaceholders(viewer, content.get(resolveContentIndex())));
+    }
+
+    /**
+     * 解析前缀内容，查看者为离线玩家（内嵌占位符以离线玩家上下文解析）。
+     *
+     * @param viewer 离线玩家查看者
+     * @return 解析后的前缀内容
+     */
+    @NotNull
+    public String getContentForOffline(OfflinePlayer viewer) {
+        if (content.isEmpty()) return "?";
+        String raw = content.get(resolveContentIndex());
+        String parsed = MessageUtils.hasPlaceholderAPI() ? PlaceholderAPI.setPlaceholders(viewer, raw) : raw;
+        return ColorParser.parse(parsed);
+    }
+
+    /**
+     * 计算当前应使用的内容索引。
+     *
+     * @return 内容列表索引
+     */
+    protected int resolveContentIndex() {
+        if (period < 0 || content.size() == 1) return 0;
         if (period == 0) {
             // PERIOD 为0时，随机返回一个内容
-            int index = RANDOM.nextInt(content.size());
-            return ColorParser.parse(MessageUtils.setPlaceholders(viewer, content.get(index)));
+            return RANDOM.nextInt(content.size());
         } else {
             // 可变化的内容，则基于偏移量与时间戳计算目标index
             long curr = System.currentTimeMillis();
             long offset = curr % period; // 计算偏移量
-            int index = (int) (offset / (period / content.size())); // 计算索引
-            return ColorParser.parse(MessageUtils.setPlaceholders(viewer, content.get(index)));
+            return (int) (offset / (period / content.size())); // 计算索引
         }
     }
 
@@ -220,6 +242,16 @@ public class PrefixConfig {
      */
     public boolean checkPermission(Player player) {
         return permission == null || ServiceManager.hasPermission(player, permission);
+    }
+
+    /**
+     * 判断某离线玩家（以LuckPerms用户数据为准）是否有权限使用该前缀
+     *
+     * @param user LuckPerms用户数据
+     * @return 若前缀标识不存在，则返回false；若前缀为默认前缀，或该前缀无权限，或玩家有该前缀的权限，则返回true。
+     */
+    public boolean checkPermission(User user) {
+        return permission == null || ServiceManager.hasPermission(user, permission);
     }
 
 }
