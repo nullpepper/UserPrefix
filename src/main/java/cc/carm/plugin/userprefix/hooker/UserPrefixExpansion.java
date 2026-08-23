@@ -5,7 +5,7 @@ import cc.carm.lib.easyplugin.papi.expansion.SubExpansion;
 import cc.carm.lib.easyplugin.papi.handler.PlaceholderHandler;
 import cc.carm.plugin.userprefix.UserPrefixAPI;
 import cc.carm.plugin.userprefix.conf.prefix.PrefixConfig;
-import cc.carm.plugin.userprefix.manager.ServiceManager;
+import cc.carm.plugin.userprefix.manager.UserManager;
 import net.luckperms.api.model.user.User;
 import org.bukkit.OfflinePlayer;
 import org.bukkit.entity.Player;
@@ -14,6 +14,7 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.Collections;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 
@@ -101,32 +102,48 @@ public class UserPrefixExpansion extends EasyPlaceholder {
     }
 
     /**
-     * 离线玩家的前缀占位符解析：缓存命中即返回真实值；未命中则确保触发异步加载（不阻塞主线程），本次返回 Loading...。
+     * 离线玩家的前缀占位符解析：
+     * 缓存命中或LuckPerms内存命中 → 立即返回真实值；
+     * 冷数据 → 同步等待异步加载完成（上限 {@link UserManager#OFFLINE_LOAD_TIMEOUT}），
+     * 拿到结果立即返回真实称号；超时才回退 Loading...（后台加载继续，后续查询即命中）。
      *
      * @param player  离线玩家
      * @param handler 前缀处理器
      * @return 解析结果
      */
     protected Object handleOfflinePrefix(@NotNull OfflinePlayer player, @NotNull Function<PrefixConfig, Object> handler) {
-        PrefixConfig cached = UserPrefixAPI.getUserManager().getOfflinePrefix(player.getUniqueId());
-        if (cached != null) return handler.apply(cached);
-        UserPrefixAPI.getUserManager().ensureOfflineLoaded(player.getUniqueId());
-        return "Loading...";
+        try {
+            PrefixConfig prefix = UserPrefixAPI.getUserManager().loadOfflinePrefix(player.getUniqueId())
+                    .get(UserManager.OFFLINE_LOAD_TIMEOUT, TimeUnit.MILLISECONDS);
+            return handler.apply(prefix);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "Loading...";
+        } catch (Exception e) {
+            return "Loading...";
+        }
     }
 
     /**
      * 离线玩家的用户数据占位符解析（amount/has）：
-     * LuckPerms内存中已有该用户 → 立即计算；否则确保触发异步加载，本次返回 Loading...。
+     * LuckPerms内存已有该用户 → 立即计算；冷数据 → 同步等待加载完成（上限 {@link UserManager#OFFLINE_LOAD_TIMEOUT}），
+     * 超时回退 Loading...。
      *
      * @param player  离线玩家
      * @param handler 用户数据处理器
      * @return 解析结果
      */
     protected Object handleOfflineUser(@NotNull OfflinePlayer player, @NotNull Function<User, Object> handler) {
-        User user = ServiceManager.getUser(player.getUniqueId());
-        if (user != null) return handler.apply(user);
-        UserPrefixAPI.getUserManager().ensureOfflineLoaded(player.getUniqueId());
-        return "Loading...";
+        try {
+            User user = UserPrefixAPI.getUserManager().loadOfflineUser(player.getUniqueId())
+                    .get(UserManager.OFFLINE_LOAD_TIMEOUT, TimeUnit.MILLISECONDS);
+            return handler.apply(user);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "Loading...";
+        } catch (Exception e) {
+            return "Loading...";
+        }
     }
 
     @Override

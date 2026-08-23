@@ -19,6 +19,7 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BooleanSupplier;
 
@@ -36,11 +37,14 @@ public class UserManager {
     /** 离线玩家前缀缓存（UUID -> 解析结果），TTL见 {@link #OFFLINE_CACHE_TTL} */
     protected final Map<UUID, CachedPrefix> offlinePrefixCache = new ConcurrentHashMap<>();
 
-    /** 正在进行异步加载的离线玩家，用于并发去重 */
-    protected final Set<UUID> offlineLoading = ConcurrentHashMap.newKeySet();
+    /** 进行中的离线玩家数据加载（UUID -> 共享的加载Future），并发请求共享同一Future；完成后由加载方移除 */
+    protected final Map<UUID, CompletableFuture<User>> offlineLoading = new ConcurrentHashMap<>();
 
     /** 离线缓存的有效时长，防止离线期间权限/数据被外部修改后长期显示旧值 */
     protected static final long OFFLINE_CACHE_TTL = 5 * 60 * 1000L;
+
+    /** 首次冷查询同步等待LuckPerms加载的最长时长（毫秒），超时后本次回退为 Loading... */
+    public static final long OFFLINE_LOAD_TIMEOUT = 2000L;
 
     public UserManager(@NotNull PrefixManager prefixManager, @NotNull BooleanSupplier autoUse) {
         this.resolver = new PrefixResolver(prefixManager, autoUse);
@@ -199,36 +203,51 @@ public class UserManager {
     }
 
     /**
-     * 确保离线玩家的前缀数据已加载：
+     * 获取离线玩家的前缀解析结果（可等待）：
      * <ol>
-     *     <li>LuckPerms内存中已有该用户 → 同步解析并写入缓存；</li>
-     *     <li>否则 → 异步加载（同一玩家并发只会触发一次），成功或失败后写入缓存。</li>
+     *     <li>本地缓存（TTL内）命中 → 立即完成；</li>
+     *     <li>LuckPerms内存已有该用户 → 同步解析并写入缓存后完成；</li>
+     *     <li>否则 → 触发一次异步加载（并发共享同一Future），成功后解析、失败以默认前缀兜底，并写入缓存。</li>
      * </ol>
-     * 该方法不阻塞主线程，加载完成后后续的 {@link #getOfflinePrefix(UUID)} 即可命中缓存。
+     * 调用方可选择等待该Future（等待上限见 {@link #OFFLINE_LOAD_TIMEOUT}），或仅将其作为后台预热。
      *
      * @param uuid 玩家UUID
+     * @return 前缀解析结果
      */
-    public void ensureOfflineLoaded(@NotNull UUID uuid) {
-        if (getOfflinePrefix(uuid) != null) return; // 缓存仍有效，无需重新加载
-
-        User user = ServiceManager.getUser(uuid); // LuckPerms内存缓存，同步获取
-        if (user != null) {
-            cacheOfflinePrefix(uuid, resolver.resolve(UserData.of(user)));
-            return;
-        }
-
-        if (!offlineLoading.add(uuid)) return; // 已有同玩家的加载任务在途，去重
-
-        ServiceManager.loadUser(uuid).whenComplete((loaded, ex) -> {
-            offlineLoading.remove(uuid);
+    @NotNull
+    public CompletableFuture<PrefixConfig> loadOfflinePrefix(@NotNull UUID uuid) {
+        PrefixConfig cached = getOfflinePrefix(uuid);
+        if (cached != null) return CompletableFuture.completedFuture(cached);
+        return loadOfflineUser(uuid).handle((user, ex) -> {
+            PrefixConfig prefix;
             if (ex != null) {
                 // 加载失败：缓存默认前缀，避免占位符永久停留在 Loading...
                 Main.debugging("加载离线玩家(" + uuid + ")的LuckPerms数据失败，将使用默认前缀。 " + ex);
-                cacheOfflinePrefix(uuid, UserPrefixAPI.getDefaultPrefix());
+                prefix = UserPrefixAPI.getDefaultPrefix();
             } else {
-                cacheOfflinePrefix(uuid, resolver.resolve(UserData.of(loaded)));
+                prefix = resolver.resolve(UserData.of(user));
             }
+            cacheOfflinePrefix(uuid, prefix);
+            return prefix;
         });
+    }
+
+    /**
+     * 获取离线玩家的LuckPerms用户数据（可等待）：
+     * <ol>
+     *     <li>LuckPerms内存已有该用户 → 立即完成；</li>
+     *     <li>否则 → 触发一次异步加载，同一玩家并发请求共享同一个Future。</li>
+     * </ol>
+     *
+     * @param uuid 玩家UUID
+     * @return 用户数据；加载失败时该Future将以异常完成，由调用方决定兜底
+     */
+    @NotNull
+    public CompletableFuture<User> loadOfflineUser(@NotNull UUID uuid) {
+        User user = ServiceManager.getUser(uuid); // LuckPerms内存缓存，同步获取
+        if (user != null) return CompletableFuture.completedFuture(user);
+        return offlineLoading.computeIfAbsent(uuid,
+                id -> ServiceManager.loadUser(id).whenComplete((loaded, ex) -> offlineLoading.remove(id)));
     }
 
     protected void cacheOfflinePrefix(@NotNull UUID uuid, @NotNull PrefixConfig prefix) {
