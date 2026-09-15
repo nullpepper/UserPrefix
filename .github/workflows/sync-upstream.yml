@@ -110,6 +110,14 @@ jobs:
           fetch-depth: 0
           token: ${{ github.token }}
 
+      - name: 配置 git 身份
+        if: steps.decide.outputs.go == 'true'
+        run: |
+          # runner 上默认没有 git 身份，不设置的话 git merge 会报
+          # "fatal: empty ident name ... not allowed"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
       - name: 拉取上游
         if: steps.decide.outputs.go == 'true'
         env:
