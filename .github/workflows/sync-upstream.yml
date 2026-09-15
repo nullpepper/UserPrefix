@@ -41,26 +41,36 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     env:
-      UPSTREAM: ${{ github.event.repository.parent.full_name || github.repository }}
+      # 注意：workflow_dispatch 的事件负载里 parent 字段是空的，
+      # 所以这里只作为初值，真正的上游在「解析仓库信息」步骤里用 API 兜底确认。
+      EVENT_PARENT: ${{ github.event.repository.parent.full_name }}
       FORK: ${{ github.repository }}
       TARGET: ${{ inputs.target_branch || github.event.repository.default_branch }}
     steps:
       - name: 解析仓库信息
         id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "$UPSTREAM" = "$FORK" ]; then
-            echo "::error::$FORK 不是 fork，没有上游可同步。"
+          upstream="${EVENT_PARENT:-}"
+          if [ -z "$upstream" ]; then
+            # workflow_dispatch / schedule 走这里：问 API 要父仓库
+            upstream=$(gh api "repos/$FORK" --jq '.parent.full_name // ""' 2>/dev/null || true)
+          fi
+          if [ -z "$upstream" ] || [ "$upstream" = "$FORK" ]; then
+            echo "::error::$FORK 不是 fork（找不到父仓库），没有上游可同步。"
             exit 1
           fi
-          echo "上游: $UPSTREAM"
+          echo "上游: $upstream"
           echo "fork: $FORK"
           echo "目标分支: $TARGET"
-          echo "upstream=$UPSTREAM" >> "$GITHUB_OUTPUT"
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
 
       - name: 检查上游是否发了新 release
         id: detect
         env:
           GH_TOKEN: ${{ github.token }}
+          UPSTREAM: ${{ steps.meta.outputs.upstream }}
         run: |
           # 取上游「最新一个非 prerelease」的 tag 名
           tag=$(gh api "repos/$UPSTREAM/releases" \
@@ -187,7 +197,7 @@ jobs:
             echo ""
             echo "| 项 | 值 |"
             echo "| --- | --- |"
-            echo "| 上游 | \`$UPSTREAM\` |"
+            echo "| 上游 | \`${{ steps.meta.outputs.upstream }}\` |"
             echo "| fork | \`$FORK\` |"
             echo "| 目标分支 | \`$TARGET\` |"
             echo "| 上游最新 release | \`${{ steps.detect.outputs.tag }}\` |"
