@@ -32,6 +32,10 @@ on:
 
 permissions:
   contents: write
+  # 上游的提交可能改到 .github/workflows/ 下的文件；
+  # 缺这个权限时推送会被拒：
+  # "refusing to allow a GitHub App to create or update workflow ... without `workflows` permission"
+  actions: write
 
 concurrency:
   group: sync-upstream
