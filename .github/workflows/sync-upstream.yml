@@ -136,6 +136,7 @@ jobs:
         id: merge
         if: steps.decide.outputs.go == 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
           UPSTREAM: ${{ steps.meta.outputs.upstream }}
           TARGET: ${{ env.TARGET }}
         run: |
@@ -157,6 +158,26 @@ jobs:
             exit 0
           fi
 
+          # 默认分支：用 GitHub 服务端的 merge-upstream 接口同步（网页「Sync fork」按钮
+          # 背后的接口）。必须在服务端做——GITHUB_TOKEN 没有 workflows 权限，
+          # 本地推送一旦涉及 .github/workflows/ 下的改动就会被拒。
+          if [ "$TARGET" = "${{ github.event.repository.default_branch }}" ]; then
+            out=$(gh api -X POST "repos/$FORK/merge-upstream" -f branch="$TARGET" 2>&1) || {
+              echo "::error::merge-upstream 失败（常见原因：上游与本地改动冲突）。"
+              echo "$out"
+              echo "::error::处理办法：把你自己的改动挪到别的分支，或手动解决冲突后再重跑。"
+              exit 1
+            }
+            echo "服务端同步结果: $out"
+            echo "mode=api-merge" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 非默认分支：只能在本地合并再推送。
+          # 注意：GITHUB_TOKEN 无法推送 .github/workflows/ 下的改动；
+          # 若上游这次改了 workflow 文件，推送会被拒。这种情况请在仓库里配置一个
+          # 带 workflow scope 的 PAT（secret 名如 SYNC_TOKEN），并把下面的
+          # github.token 换成 secrets.SYNC_TOKEN。
           before=$(git rev-parse HEAD)
           if ! git merge --no-edit "upstream/$TARGET"; then
             echo "::error::合并冲突，已中止合并，远端未做任何改动。"
