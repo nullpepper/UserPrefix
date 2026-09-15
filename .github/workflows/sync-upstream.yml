@@ -98,8 +98,10 @@ jobs:
         env:
           FORCE: ${{ inputs.force }}
           TRIGGERED: ${{ steps.detect.outputs.triggered }}
+          EVENT: ${{ github.event_name }}
         run: |
-          if [ "$FORCE" = "true" ] || [ "$TRIGGERED" = "true" ]; then
+          # repository_dispatch 是你主动发信号，说明「就是要现在同步」，不再看 release
+          if [ "$EVENT" = "repository_dispatch" ] || [ "$FORCE" = "true" ] || [ "$TRIGGERED" = "true" ]; then
             echo "go=true" >> "$GITHUB_OUTPUT"
           else
             echo "go=false" >> "$GITHUB_OUTPUT"
