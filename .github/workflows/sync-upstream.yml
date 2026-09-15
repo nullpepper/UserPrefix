@@ -1,0 +1,197 @@
+name: Sync with upstream
+
+# 上游（父仓库）发布 release / 打 tag / 推提交时，GitHub 不会给 fork 发任何事件，
+# 所以「上游一发 release 就同步」只能靠这里定时轮询上游来判断。
+#
+# 同步策略：自动 merge 上游默认分支到本仓库默认分支。
+#   - 能快进就快进；
+#   - 你自己在默认分支上有提交时会产生一个 merge 提交（上游历史里多一个合并节点）；
+#   - 一旦冲突，任务失败停下，不会覆盖或丢弃任何代码。
+#   - 你自己的其他分支（如 feat/*）永远不被触碰。
+on:
+  schedule:
+    # 每天一次（UTC 04:17，北京时间 12:17，避开整点排队）
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "上游没有新 release 时也照常同步"
+        type: boolean
+        default: false
+      sync_tags:
+        description: "同时把上游的 tags 同步到 fork（Release 页面仍然不会同步）"
+        type: boolean
+        default: true
+      target_branch:
+        description: "要更新的分支，留空 = 仓库默认分支（一般不用改）"
+        type: string
+        required: false
+        default: ""
+  repository_dispatch:
+    types: [upstream-release]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM: ${{ github.event.repository.parent.full_name || github.repository }}
+      FORK: ${{ github.repository }}
+      TARGET: ${{ inputs.target_branch || github.event.repository.default_branch }}
+    steps:
+      - name: 解析仓库信息
+        id: meta
+        run: |
+          if [ "$UPSTREAM" = "$FORK" ]; then
+            echo "::error::$FORK 不是 fork，没有上游可同步。"
+            exit 1
+          fi
+          echo "上游: $UPSTREAM"
+          echo "fork: $FORK"
+          echo "目标分支: $TARGET"
+          echo "upstream=$UPSTREAM" >> "$GITHUB_OUTPUT"
+
+      - name: 检查上游是否发了新 release
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 取上游「最新一个非 prerelease」的 tag 名
+          tag=$(gh api "repos/$UPSTREAM/releases" \
+                  --jq '[.[] | select(.prerelease == false)][0].tag_name' 2>/dev/null || true)
+          echo "上游最新 release: ${tag:-<无>}"
+          have=""
+          if [ -n "$tag" ]; then
+            have=$(gh api "repos/$FORK/releases/tags/$tag" --jq .tag_name 2>/dev/null || true)
+          fi
+          if [ -n "$tag" ] && [ -z "$have" ]; then
+            echo "→ fork 上还没有 $tag，判定为「上游有新 release」"
+            echo "triggered=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "→ 没有发现新的 release"
+            echo "triggered=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: 决定是否执行同步
+        id: decide
+        env:
+          FORCE: ${{ inputs.force }}
+          TRIGGERED: ${{ steps.detect.outputs.triggered }}
+        run: |
+          if [ "$FORCE" = "true" ] || [ "$TRIGGERED" = "true" ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            echo "跳过：上游没有新 release。手动同步请在 Actions 页面 Run workflow 时勾选 force。"
+          fi
+
+      - name: 检出 fork
+        if: steps.decide.outputs.go == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET }}
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: 拉取上游
+        if: steps.decide.outputs.go == 'true'
+        env:
+          UPSTREAM: ${{ steps.meta.outputs.upstream }}
+        run: |
+          git remote add upstream "https://github.com/$UPSTREAM.git" 2>/dev/null \
+            || git remote set-url upstream "https://github.com/$UPSTREAM.git"
+          git fetch --no-tags upstream "+refs/heads/*:refs/remotes/upstream/*"
+          git fetch --tags upstream
+
+      - name: 同步目标分支（保留你自己的分支）
+        id: merge
+        if: steps.decide.outputs.go == 'true'
+        env:
+          UPSTREAM: ${{ steps.meta.outputs.upstream }}
+          TARGET: ${{ env.TARGET }}
+        run: |
+          # 与 GitHub Actions 默认的 bash -e 行为保持一致（本地/CI 跑法一致）
+          set -euo pipefail
+          if ! git rev-parse --verify --quiet "refs/remotes/upstream/$TARGET" >/dev/null; then
+            echo "::error::上游没有 $TARGET 分支，无法同步。可用 target_branch 指定别的分支。"
+            exit 1
+          fi
+
+          behind=$(git rev-list --count "HEAD..upstream/$TARGET")
+          ahead=$(git rev-list --count "upstream/$TARGET..HEAD")
+          echo "本地 $TARGET 落后上游 $behind 个提交，领先 $ahead 个提交"
+          echo "上游最新提交: $(git log -1 --format='%h %s' "upstream/$TARGET")"
+
+          if [ "$behind" = "0" ]; then
+            echo "已经是最新，无需同步。"
+            echo "mode=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          before=$(git rev-parse HEAD)
+          if ! git merge --no-edit "upstream/$TARGET"; then
+            echo "::error::合并冲突，已中止合并，远端未做任何改动。"
+            echo "--- 冲突文件 ---"
+            git diff --name-only --diff-filter=U | sed 's/^/  /'
+            echo "--- 本地领先上游的提交（需要你自己处理） ---"
+            git log --oneline "upstream/$TARGET..$before" | sed 's/^/  /'
+            git merge --abort || true
+            echo "::error::处理办法：把冲突文件的改动挪到自己的分支（如 feat/*），把 $TARGET 恢复成上游的副本，再重跑本 workflow。"
+            exit 1
+          fi
+
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse "upstream/$TARGET")" ]; then
+            echo "mode=fast-forward" >> "$GITHUB_OUTPUT"
+            echo "已快进到 $(git log -1 --format='%h %s')"
+          elif [ "$(git rev-parse HEAD^)" = "$before" ]; then
+            echo "mode=merge" >> "$GITHUB_OUTPUT"
+            echo "已合并，产生 merge 提交 $(git log -1 --format='%h %s')"
+          else
+            echo "mode=unknown" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 推送
+        if: steps.decide.outputs.go == 'true'
+        env:
+          TARGET: ${{ env.TARGET }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet "origin/$TARGET" HEAD; then
+            echo "远端已经是最新，跳过推送。"
+          else
+            git push origin "HEAD:refs/heads/$TARGET"
+          fi
+
+      - name: 同步 tags（可选）
+        if: steps.decide.outputs.go == 'true' && inputs.sync_tags != false
+        run: |
+          # 注意：这里只会把 tag 推过去，GitHub Release 记录不会跟着出现。
+          git push --tags --force-with-lease origin
+
+      - name: 冲突时清理工作区
+        if: failure() && steps.merge.outputs.mode == ''
+        run: git merge --abort 2>/dev/null || true
+
+      - name: 汇总
+        if: always()
+        run: |
+          {
+            echo "## 同步结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 上游 | \`$UPSTREAM\` |"
+            echo "| fork | \`$FORK\` |"
+            echo "| 目标分支 | \`$TARGET\` |"
+            echo "| 上游最新 release | \`${{ steps.detect.outputs.tag }}\` |"
+            echo "| 是否执行同步 | ${{ steps.decide.outputs.go }} |"
+            echo "| 同步方式 | ${{ steps.merge.outputs.mode }} |"
+            echo "| 结论 | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
